@@ -89,7 +89,7 @@ test_gpt2: test_gpt2.c
 
 # possibly may want to disable warnings? e.g. append -Xcompiler -Wno-unused-result
 train_gpt2cu: train_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) -g $< $(NVCC_LDFLAGS) -o $@
 
 test_gpt2cu: test_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@

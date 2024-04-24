@@ -1249,7 +1249,7 @@ float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
         num_activations += act_sizes[i];
     }
     float* acts_memory;
-    cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+    cudaCheck(cudaMallocManaged((void**)&acts_memory, num_activations * sizeof(float)));
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < n; i++) {
         *(targets[i]) = acts_memory_iterator;
@@ -1833,6 +1833,39 @@ const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
     }
 }
 
+void tokenizer_encode(Tokenizer *tokenizer, const char *input_string, uint32_t *output_tokens, uint32_t *num_tokens) {
+        char *input = strdup(input_string);
+        // char *tokens = strtok(tokenized_string, " ");
+        while (*input != '\0') {
+        int max_token_length = 0;
+        int max_token_id = -1;
+        for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+            if (strncmp(input, tokenizer->token_table[i], strlen(tokenizer->token_table[i])) == 0) {
+                int token_length = strlen(tokenizer->token_table[i]);
+                if (token_length > max_token_length) {
+                    max_token_length = token_length;
+                    max_token_id = i;
+                }
+            }
+        }
+        if (max_token_id != -1) {
+            if (*num_tokens >= 256) {
+    fprintf(stderr, "Error: Exceeded the token buffer limit!\n");
+    break;
+} else {
+    output_tokens[(*num_tokens)++] = max_token_id;
+}
+            printf("token: %s -> id: %d \n", input, max_token_id);
+            printf("id %d -> token %s \n", max_token_id, tokenizer_decode(tokenizer, max_token_id));
+            input += max_token_length;
+        } else {
+            // If no token matches, just move one byte ahead
+            output_tokens[(*num_tokens)++] = *input;
+            input++;
+        }
+    }
+
+}
 void tokenizer_free(Tokenizer *tokenizer) {
     if (tokenizer->init_ok) {
         for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
@@ -1901,7 +1934,7 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
     const char* output_log_file = NULL;
-    int B = 4; // batch size
+    int B = 1; // batch size
     int T = 1024; // sequence length max
     float learning_rate = 3e-4f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
@@ -1977,7 +2010,7 @@ int main(int argc, char *argv[]) {
     dataloader_init(&train_loader, train_tokens_filename, B, T);
     DataLoader val_loader;
     dataloader_init(&val_loader, val_tokens_filename, B, T);
-    int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
+    int train_num_batches = 1; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
     printf("| val_num_batches       | %-50d |\n", val_num_batches);
@@ -2002,91 +2035,137 @@ int main(int argc, char *argv[]) {
     // train
     struct timespec start, end;
     double total_sum_iteration_time_s = 0.0;
-    for (int step = 0; step <= train_num_batches; step++) {
-        int last_step = step == train_num_batches;
+    //for (int step = 0; step <= train_num_batches; step++) {
+    //    int last_step = step == train_num_batches;
 
-        // once in a while estimate the validation loss
-        if (step % val_loss_every == 0 || last_step) {
-            float val_loss = 0.0f;
-            dataloader_reset(&val_loader);
-            for (int i = 0; i < val_num_batches; i++) {
-                dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
-                val_loss += model.mean_loss;
-            }
-            val_loss /= val_num_batches;
-            printf("val loss %f\n", val_loss);
-            logger_log_val(&logger, step, val_loss);
-        }
+    //    // once in a while estimate the validation loss
+    //    if (step % val_loss_every == 0 || last_step) {
+    //        float val_loss = 0.0f;
+    //        dataloader_reset(&val_loader);
+    //        for (int i = 0; i < val_num_batches; i++) {
+    //            dataloader_next_batch(&val_loader);
+    //            gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+    //            val_loss += model.mean_loss;
+    //        }
+    //        val_loss /= val_num_batches;
+    //        printf("val loss %f\n", val_loss);
+    //        logger_log_val(&logger, step, val_loss);
+    //    }
 
-        // once in a while do model inference to print generated text
-        if (step > 0 && step % sample_every == 0 || last_step) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = GPT2_EOT;
-            }
-            // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                // note that inference is very wasteful here because for each token
-                // we re-calculate the forward pass for all of (B,T) positions from scratch
-                // but the inference here is just for sanity checking anyway
-                // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
-                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                // we're in principle running B "inference streams" in parallel here
-                // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
-                // get the V-dimensional vector probs[0, t-1, :]
-                float* logits = model.acts.output + (t - 1) * model.config.vocab_size;
-                // move probs back to CPU and sample
-                cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
-                float coin = random_f32(&rng_state);
-                int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
-                fflush(stdout);
-            }
-            printf("\n---\n");
-        }
+    //    // once in a while do model inference to print generated text
+    //    if (step > 0 && step % sample_every == 0 || last_step) {
+    //        // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+    //        for(int i = 0; i < B * T; ++i) {
+    //            gen_tokens[i] = GPT2_EOT;
+    //        }
+    //        // now sample from the model autoregressively
+    //        printf("generating:\n---\n");
+    //        for (int t = 1; t < genT; t++) {
+    //            // note that inference is very wasteful here because for each token
+    //            // we re-calculate the forward pass for all of (B,T) positions from scratch
+    //            // but the inference here is just for sanity checking anyway
+    //            // and we can maybe optimize a bit more later, with careful tests
+    //            gpt2_forward(&model, gen_tokens, NULL, B, T);
+    //            // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+    //            // we're in principle running B "inference streams" in parallel here
+    //            // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
+    //            // get the V-dimensional vector probs[0, t-1, :]
+    //            float* logits = model.acts.output + (t - 1) * model.config.vocab_size;
+    //            // move probs back to CPU and sample
+    //            cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+    //            float coin = random_f32(&rng_state);
+    //            int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
+    //            gen_tokens[t] = next_token;
+    //            // print the generated token, either using the Tokenizer or a fallback
+    //            if (tokenizer.init_ok) {
+    //                const char* token_str = tokenizer_decode(&tokenizer, next_token);
+    //                safe_printf(token_str);
+    //            } else {
+    //                // fall back to printing the token id
+    //                printf("%d ", next_token);
+    //            }
+    //            fflush(stdout);
+    //        }
+    //        printf("\n---\n");
+    //    }
 
-        // bit confusing: we want to make sure to eval and sample on 0th iteration
-        // but also after the very last iteration. so we loop for step <= train_num_batches
-        // instead of just < train_num_batches (one extra due to <=), only to do
-        // the validation/sampling one last time, and then we break right here as we're done.
-        if (last_step) { break; }
+    //    // bit confusing: we want to make sure to eval and sample on 0th iteration
+    //    // but also after the very last iteration. so we loop for step <= train_num_batches
+    //    // instead of just < train_num_batches (one extra due to <=), only to do
+    //    // the validation/sampling one last time, and then we break right here as we're done.
+    //    if (last_step) { break; }
 
-        // do a training step
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model);
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-        cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        total_sum_iteration_time_s += time_elapsed_s;
-        int tokens_per_second = (B * T) / time_elapsed_s;
-        printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
-        logger_log_train(&logger, step, model.mean_loss);
-    }
+    //    // do a training step
+    //    clock_gettime(CLOCK_MONOTONIC, &start);
+    //    dataloader_next_batch(&train_loader);
+    //    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+    //    gpt2_zero_grad(&model);
+    //    gpt2_backward(&model);
+    //    gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+    //    cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
+    //    clock_gettime(CLOCK_MONOTONIC, &end);
+    //    double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    //    total_sum_iteration_time_s += time_elapsed_s;
+    //    int tokens_per_second = (B * T) / time_elapsed_s;
+    //    printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
+    //    logger_log_train(&logger, step, model.mean_loss);
+    //}
     // add a total average, for optimizations that are only mild improvements
     printf("total average iteration time: %f ms\n", total_sum_iteration_time_s / train_num_batches * 1000);
 
+            uint32_t output_tokens[256];
+            uint32_t num_tokens = 0;
+            tokenizer_encode(&tokenizer, "GPT2 is a model developed by OpenAI.", output_tokens, &num_tokens);
+            for(int i = 0; i < B; i++) {
+                for(int n = 0; n<num_tokens; n++){
+                    gen_tokens[i*T + n] = output_tokens[n];
+                }  
+            for(int j = num_tokens; j < T; j++) {
+               gen_tokens[i*T+j] = GPT2_EOT; 
+
+            }
+            }
+        for (uint32_t i = 0; i < num_tokens; i++) {
+            
+            printf("output token id: %d\n", output_tokens[i]);
+        }
+        for (uint32_t i = 0; i < B*T; ++i) {
+            
+            printf("%d gen token id: %d\n", i, gen_tokens[i]);
+        }
+            for (int t = 1; t < genT; t++) {
+               // note that inference is very wasteful here because for each token
+               // we re-calculate the forward pass for all of (B,T) positions from scratch
+               // but the inference here is just for sanity checking anyway
+               // and we can maybe optimize a bit more later, with careful tests
+               gpt2_forward(&model, gen_tokens, NULL, B, T);
+               // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+               // we're in principle running B "inference streams" in parallel here
+               // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
+               // get the V-dimensional vector probs[0, t-1, :]
+               float* logits = model.acts.output + (t - 1) * model.config.vocab_size;
+               // move probs back to CPU and sample
+               cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+               float coin = random_f32(&rng_state);
+               int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
+               gen_tokens[t] = next_token;
+               // print the generated token, either using the Tokenizer or a fallback
+               if (tokenizer.init_ok) {
+                   const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                   safe_printf(token_str);
+               } else {
+                   // fall back to printing the token id
+                   printf("%d ", next_token);
+               }
+               fflush(stdout);
+            }
     // free
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(cpu_logits);
-    free(gen_tokens);
+    // free(gen_tokens);
     cudaCheck(cudaFree(cublaslt_workspace));
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
